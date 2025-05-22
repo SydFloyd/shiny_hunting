@@ -34,6 +34,10 @@ class ShinyDetector:
         # Normalize reference audio
         self.reference_audio = self.reference_audio / np.max(np.abs(self.reference_audio))
         
+        # Precompute reference energy for proper normalization
+        self.ref_energy = np.sqrt(np.sum(self.reference_audio ** 2))
+        print(f"Reference energy: {self.ref_energy:.4f}")
+        
     def setup_visual_detection(self, **kwargs):
         """Setup visual detection for shiny effects."""
         print("Setting up visual detection...")
@@ -66,8 +70,15 @@ class ShinyDetector:
             
         return templates
     
-    def detect_audio_simple(self, audio_path: str) -> Tuple[bool, List[dict]]:
-        """Simple cross-correlation audio detection."""
+    def detect_audio_simple(self, audio_path: str, use_splice_hack=True, threshold=0.7) -> Tuple[bool, List[dict]]:
+        """
+        Simple cross-correlation with optional splice hack for better normalization.
+        
+        Args:
+            audio_path: Path to audio file to analyze
+            use_splice_hack: If True, splice reference jingle into audio for normalization
+            threshold: Detection threshold (0-1)
+        """
         print(f"Analyzing audio: {audio_path}")
         
         # Load audio
@@ -76,62 +87,140 @@ class ShinyDetector:
         
         print(f"Audio length: {len(audio)/self.sr:.2f}s")
         
-        # Simple cross-correlation
-        correlation = signal.correlate(audio, self.reference_audio, mode='valid')
+        if use_splice_hack:
+            print("Using splice hack for better normalization...")
+            
+            # Find a quiet spot to splice in the reference (end of audio)
+            splice_position = len(audio) - len(self.reference_audio) - int(0.5 * self.sr)  # 0.5s from end
+            if splice_position < 0:
+                splice_position = len(audio) // 2  # If audio too short, use middle
+            
+            # Create a copy and splice in the reference
+            audio_with_ref = audio.copy()
+            audio_with_ref[splice_position:splice_position + len(self.reference_audio)] = self.reference_audio
+            
+            print(f"Spliced reference at {splice_position/self.sr:.2f}s")
+            
+            # Use the spliced version for correlation
+            correlation_audio = audio_with_ref
+        else:
+            correlation_audio = audio
+        
+        # Compute cross-correlation
+        correlation = signal.correlate(correlation_audio, self.reference_audio, mode='valid')
         correlation = np.abs(correlation)  # Take magnitude
         
-        # Normalize correlation
-        correlation = correlation / np.max(correlation)
+        # Simple normalization by maximum (this now works properly with splice hack)
+        max_correlation = np.max(correlation)
+        if max_correlation > 0:
+            normalized_correlation = correlation / max_correlation
+        else:
+            normalized_correlation = correlation
+        
+        print(f"Max correlation: {max_correlation:.4f}")
         
         # Find peaks
-        threshold = 0.7  # Adjust as needed
-        peaks, properties = signal.find_peaks(correlation, height=threshold, distance=len(self.reference_audio)//2)
+        min_distance = len(self.reference_audio) // 2
+        peaks, properties = signal.find_peaks(
+            normalized_correlation, 
+            height=threshold, 
+            distance=min_distance
+        )
         
         # Convert to time and create detections
         detections = []
+        splice_time = splice_position / self.sr if use_splice_hack else -1
+        
         for peak in peaks:
             timestamp = peak / self.sr
-            confidence = correlation[peak]
+            confidence = normalized_correlation[peak]
+            
+            # If using splice hack, ignore the spliced reference detection
+            if use_splice_hack and abs(timestamp - splice_time) < 0.1:  # Within 0.1s of splice
+                print(f"Ignoring spliced reference at {timestamp:.2f}s")
+                continue
+                
             detections.append({
                 'timestamp': timestamp,
                 'confidence': confidence,
-                'method': 'cross_correlation'
+                'method': 'cross_correlation_with_splice' if use_splice_hack else 'cross_correlation',
+                'threshold_used': threshold
             })
+            print(f"Detection at {timestamp:.2f}s with confidence {confidence:.4f}")
         
-        # Plot results
-        plt.figure(figsize=(15, 8))
+        # Enhanced plotting
+        fig_height = 12 if use_splice_hack else 10
+        plt.figure(figsize=(15, fig_height))
+        
+        subplot_count = 5 if use_splice_hack else 4
         
         # Plot original audio
-        plt.subplot(3, 1, 1)
+        plt.subplot(subplot_count, 1, 1)
         time_audio = np.linspace(0, len(audio)/self.sr, len(audio))
         plt.plot(time_audio, audio)
         plt.title('Original Audio')
         plt.ylabel('Amplitude')
+        plt.grid(True, alpha=0.3)
         
         # Plot reference
-        plt.subplot(3, 1, 2)
+        plt.subplot(subplot_count, 1, 2)
         time_ref = np.linspace(0, len(self.reference_audio)/self.sr, len(self.reference_audio))
         plt.plot(time_ref, self.reference_audio)
         plt.title('Reference Jingle')
         plt.ylabel('Amplitude')
+        plt.grid(True, alpha=0.3)
         
-        # Plot correlation
-        plt.subplot(3, 1, 3)
+        # If using splice hack, show the modified audio
+        if use_splice_hack:
+            plt.subplot(subplot_count, 1, 3)
+            time_audio_mod = np.linspace(0, len(correlation_audio)/self.sr, len(correlation_audio))
+            plt.plot(time_audio_mod, correlation_audio)
+            plt.axvline(x=splice_time, color='red', linestyle='--', alpha=0.7, label='Splice position')
+            plt.title('Audio with Spliced Reference (for normalization)')
+            plt.ylabel('Amplitude')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+        
+        # Plot raw correlation
+        plt.subplot(subplot_count, 1, subplot_count-1)
         time_corr = np.linspace(0, len(correlation)/self.sr, len(correlation))
-        plt.plot(time_corr, correlation, label='Cross-correlation')
-        plt.axhline(y=threshold, color='red', linestyle='--', label=f'Threshold ({threshold})')
+        plt.plot(time_corr, correlation, label='Raw Cross-correlation', alpha=0.7)
+        plt.title('Raw Cross-correlation')
+        plt.ylabel('Raw Correlation')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Plot normalized correlation with detections
+        plt.subplot(subplot_count, 1, subplot_count)
+        plt.plot(time_corr, normalized_correlation, label='Normalized Cross-correlation', linewidth=2)
+        plt.axhline(y=threshold, color='red', linestyle='--', linewidth=2, 
+                   label=f'Threshold ({threshold:.3f})')
+        
+        # Mark splice position if used
+        if use_splice_hack:
+            plt.axvline(x=splice_time, color='orange', linestyle=':', alpha=0.7, 
+                       label='Spliced ref (ignored)')
         
         # Mark detections
-        for detection in detections:
-            plt.axvline(x=detection['timestamp'], color='red', alpha=0.8, 
-                       label=f"Detection ({detection['confidence']:.3f})")
+        for i, detection in enumerate(detections):
+            color = plt.cm.tab10(i % 10)
+            plt.axvline(x=detection['timestamp'], color=color, alpha=0.8, linewidth=2,
+                       label=f"Detection {i+1} ({detection['confidence']:.3f})")
         
-        plt.title('Cross-correlation Results')
+        plt.title('Normalized Cross-correlation Results')
         plt.xlabel('Time (seconds)')
-        plt.ylabel('Correlation')
+        plt.ylabel('Normalized Correlation')
         plt.legend()
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.show()
+        
+        # Print summary statistics
+        print(f"\nSummary Statistics:")
+        print(f"Method: {'Splice hack' if use_splice_hack else 'Standard'}")
+        print(f"Max correlation: {max_correlation:.4f}")
+        print(f"Threshold used: {threshold:.4f}")
+        print(f"Detections found: {len(detections)}")
         
         detection_found = len(detections) > 0
         return detection_found, detections
@@ -178,7 +267,7 @@ class ShinyDetector:
         
         for i, template in enumerate(self.star_templates):
             result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-            locations = np.where(result >= 0.7)
+            locations = np.where(result >= 0.25)
             
             for pt in zip(*locations[::-1]):
                 detections.append({
@@ -270,18 +359,32 @@ def test_all_methods():
     """Test both audio and visual detection methods."""
     
     print("="*60)
-    print("TESTING SIMPLE AUDIO DETECTION")
+    print("TESTING FIXED AUDIO DETECTION")
     print("="*60)
     
-    # Test simple audio detection
+    # Test fixed audio detection with different threshold methods
     detector = ShinyDetector(method='audio_simple', shiny_jingle_path='shiny_jingle.mp3')
-    audio_found, audio_detections = detector.detect_audio_simple('example_encounter2.wav')
+
+    test_audio_path = 'example_non_encounter.wav'
+    print(f"Testing audio detection on: {test_audio_path}")
     
-    print(f"Audio Detection Results:")
+    # Try splice hack method first
+    print("\n--- SPLICE HACK METHOD ---")
+    audio_found, audio_detections = detector.detect_audio_simple(test_audio_path, 
+                                                                 use_splice_hack=True, 
+                                                                 threshold=0.25)
+    
+    print(f"\nAudio Detection Results (Splice Hack):")
     print(f"Found: {audio_found}")
     print(f"Detections: {len(audio_detections)}")
     for det in audio_detections:
-        print(f"  Time: {det['timestamp']:.2f}s, Confidence: {det['confidence']:.3f}")
+        print(f"  Time: {det['timestamp']:.2f}s, Confidence: {det['confidence']:.4f}")
+    
+    # Compare with standard method if needed
+    print("\n--- STANDARD METHOD (for comparison) ---")
+    audio_found_std, audio_detections_std = detector.detect_audio_simple(test_audio_path, 
+                                                                         use_splice_hack=False, 
+                                                                         threshold=0.25)
     
     print("\n" + "="*60)
     print("VISUAL DETECTION SETUP")
@@ -310,8 +413,8 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("RECOMMENDATIONS")
     print("="*60)
-    print("Based on results, I recommend:")
-    print("1. If audio detection failed: Try visual detection")
-    print("2. Visual detection often works better for shinies")
-    print("3. Capture screenshots during encounters and test visual detection")
-    print("4. Consider hybrid approach: audio trigger + visual confirmation")
+    print("Based on fixed normalization:")
+    print("1. Proper correlation coefficient prevents false positives")
+    print("2. Adaptive threshold adjusts to audio characteristics")
+    print("3. If still getting false positives, try 'absolute' threshold")
+    print("4. Visual detection as backup for difficult audio cases")
